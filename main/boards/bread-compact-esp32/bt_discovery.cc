@@ -192,6 +192,19 @@ void GapCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* param) {
 void DiscoveryTask(void*) {
     WaitForStableReady();
 
+    // This companion only uses Classic Bluetooth. Release the controller memory
+    // reserved for BLE before evaluating the Classic-BT heap gate. This operation
+    // is one-way until reboot, which is fine because BLE is intentionally unused.
+    LogHeap("before_ble_release");
+    esp_err_t ble_release_err = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+    if (ble_release_err == ESP_OK) {
+        ESP_LOGI(TAG, "BLE controller memory released for Classic BT");
+    } else {
+        ESP_LOGW(TAG, "BLE controller memory release returned: %s",
+                 esp_err_to_name(ble_release_err));
+    }
+    LogHeap("after_ble_release");
+
     for (int attempt = 1; attempt <= kMaxHeapChecks; ++attempt) {
         LogHeap("before_bt");
         if (HeapReadyForBt()) {
