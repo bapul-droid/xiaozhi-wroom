@@ -8,6 +8,7 @@
 #include "lamp_controller.h"
 #include "led/single_led.h"
 #include "display/oled_display.h"
+#include "bt_discovery.h"
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
@@ -44,21 +45,20 @@ private:
     }
 
     void InitializeSsd1306Display() {
-        // SSD1306 config
         esp_lcd_panel_io_i2c_config_t io_config = {
-    .dev_addr = 0x3C,
-    .on_color_trans_done = nullptr,
-    .user_ctx = nullptr,
-    .control_phase_bytes = 1,
-    .dc_bit_offset = 6,
-    .lcd_cmd_bits = 8,
-    .lcd_param_bits = 8,
-    .flags = {
-        .dc_low_on_data = 0,
-        .disable_control_phase = 0,
-    },
-    .scl_speed_hz = 400 * 1000,
-};
+            .dev_addr = 0x3C,
+            .on_color_trans_done = nullptr,
+            .user_ctx = nullptr,
+            .control_phase_bytes = 1,
+            .dc_bit_offset = 6,
+            .lcd_cmd_bits = 8,
+            .lcd_param_bits = 8,
+            .flags = {
+                .dc_low_on_data = 0,
+                .disable_control_phase = 0,
+            },
+            .scl_speed_hz = 400 * 1000,
+        };
 
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(display_i2c_bus_, &io_config, &panel_io_));
 
@@ -75,7 +75,6 @@ private:
         ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(panel_io_, &panel_config, &panel_));
         ESP_LOGI(TAG, "SSD1306 driver installed");
 
-        // Reset the display
         ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_));
         if (esp_lcd_panel_init(panel_) != ESP_OK) {
             ESP_LOGE(TAG, "Failed to initialize display");
@@ -83,7 +82,6 @@ private:
             return;
         }
 
-        // Set the display to on
         ESP_LOGI(TAG, "Turning display on");
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_, true));
 
@@ -91,16 +89,14 @@ private:
     }
 
     void InitializeButtons() {
-        
-        // 配置 GPIO
         gpio_config_t io_conf = {
-            .pin_bit_mask = 1ULL << BUILTIN_LED_GPIO,  // 设置需要配置的 GPIO 引脚
-            .mode = GPIO_MODE_OUTPUT,           // 设置为输出模式
-            .pull_up_en = GPIO_PULLUP_DISABLE,  // 禁用上拉
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,  // 禁用下拉
-            .intr_type = GPIO_INTR_DISABLE      // 禁用中断
+            .pin_bit_mask = 1ULL << BUILTIN_LED_GPIO,
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE
         };
-        gpio_config(&io_conf);  // 应用配置
+        gpio_config(&io_conf);
 
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
@@ -127,7 +123,6 @@ private:
         });
     }
 
-    // 物联网初始化，添加对 AI 可见设备
     void InitializeTools() {
         static LampController lamp(LAMP_GPIO);
     }
@@ -139,9 +134,10 @@ public:
         InitializeSsd1306Display();
         InitializeButtons();
         InitializeTools();
+        StartBtDiscoveryV1();
     }
 
-    virtual AudioCodec* GetAudioCodec() override 
+    virtual AudioCodec* GetAudioCodec() override
     {
 #ifdef AUDIO_I2S_METHOD_SIMPLEX
         static NoAudioCodecSimplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
@@ -156,7 +152,6 @@ public:
     virtual Display* GetDisplay() override {
         return display_;
     }
-
 };
 
 DECLARE_BOARD(CompactWifiBoard);
