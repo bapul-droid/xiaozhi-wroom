@@ -67,6 +67,7 @@ public:
 
     DeviceState GetDeviceState() const { return state_machine_.GetState(); }
     bool IsVoiceDetected() const { return audio_service_.IsVoiceDetected(); }
+    bool IsProtocolReady() const { return protocol_ != nullptr; }
     
     /**
      * Request state transition
