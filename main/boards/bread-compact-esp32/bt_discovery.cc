@@ -15,15 +15,17 @@ namespace {
 
 constexpr const char* TAG = "WROOM_BT";
 constexpr TickType_t kProtocolPollDelay = pdMS_TO_TICKS(10);
-constexpr TickType_t kTlsDrainPollDelay = pdMS_TO_TICKS(1);
-constexpr int kRequiredTlsDrainStableChecks = 3;
-constexpr int kMaxTlsDrainChecks = 1500;  // ~1.5 s diagnostic window
+constexpr TickType_t kTlsPollDelay = pdMS_TO_TICKS(5);
+constexpr TickType_t kTlsWindowTimeout = pdMS_TO_TICKS(6000);
 
-// V4 pre-audio diagnostic gate. While MQTT/TLS is active we previously saw
-// largest internal blocks around 21 KB. When TLS releases its transient buffers,
-// catch that short window before AudioService::Start() creates its task stacks.
-constexpr size_t kMinFreeInternalPreAudio = 40 * 1024;
-constexpr size_t kMinLargestInternalPreAudio = 24 * 1024;
+// V5 does not mistake protocol object creation for TLS completion. First observe
+// the TLS pressure dip, then wait for the internal heap to recover. The BT task
+// runs at priority 4 while the activation task runs at priority 2, so once the
+// recovery is observed it can take the table before AudioService::Start().
+constexpr size_t kTlsPressureFreeInternal = 24 * 1024;
+constexpr size_t kTlsPressureLargestInternal = 20 * 1024;
+constexpr size_t kPostTlsFreeInternal = 30 * 1024;
+constexpr size_t kPostTlsLargestInternal = 24 * 1024;
 
 char* BdaToString(const esp_bd_addr_t bda, char* out, size_t size) {
     if (bda == nullptr || out == nullptr || size < 18) {
@@ -61,57 +63,67 @@ void LogHeap(const char* phase) {
              static_cast<unsigned>(largest_spiram));
 }
 
-bool PreAudioHeapWindowOpen() {
+bool TlsPressureObserved() {
     const size_t free_internal =
         heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     const size_t largest_internal =
         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    return free_internal >= kMinFreeInternalPreAudio &&
-           largest_internal >= kMinLargestInternalPreAudio;
+    return free_internal <= kTlsPressureFreeInternal ||
+           largest_internal <= kTlsPressureLargestInternal;
+}
+
+bool PostTlsHeapRecovered() {
+    const size_t free_internal =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t largest_internal =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    return free_internal >= kPostTlsFreeInternal &&
+           largest_internal >= kPostTlsLargestInternal;
 }
 
 bool WaitForPostTlsPreAudioWindow() {
     auto& app = Application::GetInstance();
 
-    ESP_LOGI(TAG, "Bluetooth Discovery V4 waiting for protocol creation/TLS phase");
-    LogHeap("v4_start");
+    ESP_LOGI(TAG, "Bluetooth Discovery V5 waiting for protocol/TLS pressure cycle");
+    LogHeap("v5_start");
 
     while (!app.IsProtocolReady()) {
         if (app.GetDeviceState() == kDeviceStateIdle) {
-            ESP_LOGW(TAG, "V4 pre-audio window missed: application already idle");
+            ESP_LOGW(TAG, "V5 pre-audio window missed: application already idle");
             return false;
         }
         vTaskDelay(kProtocolPollDelay);
     }
 
-    ESP_LOGI(TAG, "Protocol object ready; watching for TLS heap release before audio starts");
-    LogHeap("protocol_ready_tls_active");
+    ESP_LOGI(TAG, "Protocol object ready; waiting for TLS pressure dip, not assuming TLS is done");
+    LogHeap("protocol_ready_tls_pending");
 
-    int stable_checks = 0;
-    for (int i = 0; i < kMaxTlsDrainChecks; ++i) {
+    bool saw_tls_pressure = false;
+    const TickType_t deadline = xTaskGetTickCount() + kTlsWindowTimeout;
+
+    while ((int32_t)(deadline - xTaskGetTickCount()) > 0) {
         if (app.GetDeviceState() == kDeviceStateIdle) {
-            ESP_LOGW(TAG, "V4 pre-audio window missed: audio/activation already reached idle");
+            ESP_LOGW(TAG, "V5 pre-audio window missed: activation already reached idle");
             LogHeap("pre_audio_window_missed");
             return false;
         }
 
-        if (PreAudioHeapWindowOpen()) {
-            ++stable_checks;
-            if (stable_checks >= kRequiredTlsDrainStableChecks) {
-                ESP_LOGI(TAG,
-                         "TLS heap drain detected before audio (%d stable checks); BT gets table next",
-                         kRequiredTlsDrainStableChecks);
-                LogHeap("pre_audio_window_open");
-                return true;
-            }
-        } else {
-            stable_checks = 0;
+        if (!saw_tls_pressure && TlsPressureObserved()) {
+            saw_tls_pressure = true;
+            ESP_LOGI(TAG, "TLS pressure dip observed; waiting for post-handshake heap recovery");
+            LogHeap("tls_pressure_seen");
         }
 
-        vTaskDelay(kTlsDrainPollDelay);
+        if (saw_tls_pressure && PostTlsHeapRecovered()) {
+            ESP_LOGI(TAG, "Post-TLS heap recovery detected; Classic BT takes table before audio");
+            LogHeap("post_tls_pre_audio_window");
+            return true;
+        }
+
+        vTaskDelay(kTlsPollDelay);
     }
 
-    ESP_LOGW(TAG, "V4 pre-audio heap window never opened; skipping BT rather than racing audio");
+    ESP_LOGW(TAG, "V5 timed out waiting for TLS pressure/recovery cycle; BT skipped safely");
     LogHeap("pre_audio_window_timeout");
     return false;
 }
@@ -195,8 +207,6 @@ void DiscoveryTask(void*) {
         return;
     }
 
-    // This companion only uses Classic Bluetooth. Release the BLE controller
-    // reservation immediately before Classic BT initialization.
     LogHeap("before_ble_release");
     esp_err_t ble_release_err = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
     if (ble_release_err == ESP_OK) {
@@ -207,7 +217,7 @@ void DiscoveryTask(void*) {
     }
     LogHeap("after_ble_release");
 
-    ESP_LOGI(TAG, "Initializing Classic Bluetooth Discovery V4 BEFORE audio task startup");
+    ESP_LOGI(TAG, "Initializing Classic Bluetooth Discovery V5 BEFORE audio task startup");
     LogHeap("before_bt_controller_init");
 
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
