@@ -16,11 +16,12 @@ namespace {
 constexpr const char* TAG = "WROOM_BT";
 constexpr TickType_t kStatePollDelay = pdMS_TO_TICKS(1000);
 constexpr TickType_t kRetryDelay = pdMS_TO_TICKS(5000);
-constexpr int kRequiredStableIdleChecks = 8;
+constexpr int kRequiredStableReadyChecks = 8;
 constexpr int kMaxHeapChecks = 12;
-// Discovery V2: activation/TLS gets first claim on internal RAM. Bluetooth
-// discovery is allowed only after the application has remained idle for a
-// continuous settling window, then it must still pass the heap gate.
+// Discovery V3: activation/protocol/TLS gets first claim on internal RAM.
+// Bluetooth discovery is allowed only after the application is idle AND the
+// protocol object exists for a continuous settling window, then it must still
+// pass the internal heap gate.
 constexpr size_t kMinFreeInternal = 90000;
 constexpr size_t kMinLargestInternal = 50000;
 
@@ -35,55 +36,84 @@ char* BdaToString(const esp_bd_addr_t bda, char* out, size_t size) {
 
 void LogHeap(const char* phase) {
     const size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    const size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    const size_t min_internal = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    ESP_LOGW(TAG, "HEAP %s: free_internal=%u largest_internal=%u min_internal=%u",
+    const size_t largest_internal =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t min_internal =
+        heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t free_dma = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    const size_t largest_dma =
+        heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    const size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t largest_spiram =
+        heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    ESP_LOGW(TAG,
+             "HEAP %s: internal=%u largest=%u min=%u | dma=%u largest=%u | spiram=%u largest=%u",
              phase,
              static_cast<unsigned>(free_internal),
              static_cast<unsigned>(largest_internal),
-             static_cast<unsigned>(min_internal));
+             static_cast<unsigned>(min_internal),
+             static_cast<unsigned>(free_dma),
+             static_cast<unsigned>(largest_dma),
+             static_cast<unsigned>(free_spiram),
+             static_cast<unsigned>(largest_spiram));
 }
 
 bool HeapReadyForBt() {
     const size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    const size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t largest_internal =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     return free_internal >= kMinFreeInternal && largest_internal >= kMinLargestInternal;
 }
 
-void WaitForStableIdle() {
+void WaitForStableReady() {
     auto& app = Application::GetInstance();
-    int idle_checks = 0;
+    int ready_checks = 0;
     DeviceState last_state = app.GetDeviceState();
+    bool last_protocol_ready = app.IsProtocolReady();
 
-    ESP_LOGI(TAG, "Bluetooth Discovery V2 waiting for activation/application idle");
+    ESP_LOGI(TAG, "Bluetooth Discovery V3 waiting for idle + protocol ready");
+    LogHeap("gate_start");
 
-    while (idle_checks < kRequiredStableIdleChecks) {
+    while (ready_checks < kRequiredStableReadyChecks) {
         const DeviceState state = app.GetDeviceState();
-        if (state == kDeviceStateIdle) {
-            ++idle_checks;
-            if (idle_checks == 1) {
-                ESP_LOGI(TAG, "Application idle; starting %ds settle window",
-                         kRequiredStableIdleChecks);
+        const bool protocol_ready = app.IsProtocolReady();
+        const bool ready = state == kDeviceStateIdle && protocol_ready;
+
+        if (state != last_state || protocol_ready != last_protocol_ready) {
+            ESP_LOGI(TAG, "BT gate state=%d protocol=%s",
+                     static_cast<int>(state), protocol_ready ? "ready" : "not_ready");
+            LogHeap("gate_transition");
+        }
+
+        if (ready) {
+            ++ready_checks;
+            if (ready_checks == 1) {
+                ESP_LOGI(TAG, "Idle + protocol ready; starting %ds settle window",
+                         kRequiredStableReadyChecks);
             }
         } else {
-            if (idle_checks > 0) {
-                ESP_LOGW(TAG, "Idle settle interrupted by state=%d; restarting window",
-                         static_cast<int>(state));
-            } else if (state != last_state) {
-                ESP_LOGI(TAG, "BT discovery deferred: application state=%d",
-                         static_cast<int>(state));
+            if (ready_checks > 0) {
+                ESP_LOGW(TAG,
+                         "Ready settle interrupted: state=%d protocol=%s; restarting window",
+                         static_cast<int>(state), protocol_ready ? "ready" : "not_ready");
+            } else if (state != last_state || protocol_ready != last_protocol_ready) {
+                ESP_LOGI(TAG, "BT discovery deferred: state=%d protocol=%s",
+                         static_cast<int>(state), protocol_ready ? "ready" : "not_ready");
             }
-            idle_checks = 0;
+            ready_checks = 0;
         }
 
         last_state = state;
-        if (idle_checks < kRequiredStableIdleChecks) {
+        last_protocol_ready = protocol_ready;
+        if (ready_checks < kRequiredStableReadyChecks) {
             vTaskDelay(kStatePollDelay);
         }
     }
 
-    ESP_LOGI(TAG, "Application idle stable for %ds; activation gate passed",
-             kRequiredStableIdleChecks);
+    ESP_LOGI(TAG, "Idle + protocol ready stable for %ds; activation gate passed",
+             kRequiredStableReadyChecks);
+    LogHeap("gate_passed");
 }
 
 void LogDiscoveryResult(esp_bt_gap_cb_param_t* param) {
@@ -160,7 +190,7 @@ void GapCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* param) {
 }
 
 void DiscoveryTask(void*) {
-    WaitForStableIdle();
+    WaitForStableReady();
 
     for (int attempt = 1; attempt <= kMaxHeapChecks; ++attempt) {
         LogHeap("before_bt");
@@ -177,7 +207,7 @@ void DiscoveryTask(void*) {
         vTaskDelay(kRetryDelay);
     }
 
-    ESP_LOGI(TAG, "Initializing Classic Bluetooth Discovery V2");
+    ESP_LOGI(TAG, "Initializing Classic Bluetooth Discovery V3");
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     esp_err_t err = esp_bt_controller_init(&bt_cfg);
     if (err != ESP_OK) {
