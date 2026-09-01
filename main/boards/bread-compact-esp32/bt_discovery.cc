@@ -15,17 +15,23 @@ namespace {
 
 constexpr const char* TAG = "WROOM_BT";
 constexpr TickType_t kProtocolPollDelay = pdMS_TO_TICKS(10);
-constexpr TickType_t kTlsPollDelay = pdMS_TO_TICKS(5);
+constexpr TickType_t kTlsPollDelay = pdMS_TO_TICKS(2);
 constexpr TickType_t kTlsWindowTimeout = pdMS_TO_TICKS(6000);
 
-// V5 does not mistake protocol object creation for TLS completion. First observe
-// the TLS pressure dip, then wait for the internal heap to recover. The BT task
-// runs at priority 4 while the activation task runs at priority 2, so once the
-// recovery is observed it can take the table before AudioService::Start().
+// V6: the first recovery after certificate verification is NOT enough. In V5
+// that false recovery was ~34 KB free while MQTT still had CONNECT/TLS writes
+// pending. Require a materially deeper recovery before letting Classic BT in.
 constexpr size_t kTlsPressureFreeInternal = 24 * 1024;
 constexpr size_t kTlsPressureLargestInternal = 20 * 1024;
-constexpr size_t kPostTlsFreeInternal = 30 * 1024;
-constexpr size_t kPostTlsLargestInternal = 24 * 1024;
+constexpr size_t kDeepRecoveryFreeInternal = 40 * 1024;
+constexpr size_t kDeepRecoveryLargestInternal = 28 * 1024;
+constexpr int kRequiredRecoveryChecks = 3;
+
+// Even after controller/Bluedroid init, do not launch inquiry if there is no
+// useful allocation headroom left. This avoids repeating the V5 failure where
+// Bluedroid left ~2 KB free / <1 KB largest and MQTT immediately collapsed.
+constexpr size_t kMinFreeBeforeInquiry = 10 * 1024;
+constexpr size_t kMinLargestBeforeInquiry = 6 * 1024;
 
 char* BdaToString(const esp_bd_addr_t bda, char* out, size_t size) {
     if (bda == nullptr || out == nullptr || size < 18) {
@@ -72,59 +78,76 @@ bool TlsPressureObserved() {
            largest_internal <= kTlsPressureLargestInternal;
 }
 
-bool PostTlsHeapRecovered() {
+bool DeepRecoveryObserved() {
     const size_t free_internal =
         heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     const size_t largest_internal =
         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    return free_internal >= kPostTlsFreeInternal &&
-           largest_internal >= kPostTlsLargestInternal;
+    return free_internal >= kDeepRecoveryFreeInternal &&
+           largest_internal >= kDeepRecoveryLargestInternal;
 }
 
-bool WaitForPostTlsPreAudioWindow() {
+bool InquiryHeadroomSafe() {
+    const size_t free_internal =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t largest_internal =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    return free_internal >= kMinFreeBeforeInquiry &&
+           largest_internal >= kMinLargestBeforeInquiry;
+}
+
+bool WaitForDeepPostTlsRecovery() {
     auto& app = Application::GetInstance();
 
-    ESP_LOGI(TAG, "Bluetooth Discovery V5 waiting for protocol/TLS pressure cycle");
-    LogHeap("v5_start");
+    ESP_LOGI(TAG, "Bluetooth Discovery V6 waiting for TLS pressure + deep recovery");
+    LogHeap("v6_start");
 
     while (!app.IsProtocolReady()) {
         if (app.GetDeviceState() == kDeviceStateIdle) {
-            ESP_LOGW(TAG, "V5 pre-audio window missed: application already idle");
+            ESP_LOGW(TAG, "V6 pre-audio window missed: application already idle");
             return false;
         }
         vTaskDelay(kProtocolPollDelay);
     }
 
-    ESP_LOGI(TAG, "Protocol object ready; waiting for TLS pressure dip, not assuming TLS is done");
+    ESP_LOGI(TAG, "Protocol object ready; waiting for TLS pressure dip");
     LogHeap("protocol_ready_tls_pending");
 
     bool saw_tls_pressure = false;
+    int recovery_checks = 0;
     const TickType_t deadline = xTaskGetTickCount() + kTlsWindowTimeout;
 
     while ((int32_t)(deadline - xTaskGetTickCount()) > 0) {
         if (app.GetDeviceState() == kDeviceStateIdle) {
-            ESP_LOGW(TAG, "V5 pre-audio window missed: activation already reached idle");
-            LogHeap("pre_audio_window_missed");
+            ESP_LOGW(TAG, "V6 window missed: activation/audio already reached idle");
+            LogHeap("deep_recovery_missed");
             return false;
         }
 
         if (!saw_tls_pressure && TlsPressureObserved()) {
             saw_tls_pressure = true;
-            ESP_LOGI(TAG, "TLS pressure dip observed; waiting for post-handshake heap recovery");
+            ESP_LOGI(TAG, "TLS pressure dip observed; ignoring shallow certificate recovery");
             LogHeap("tls_pressure_seen");
         }
 
-        if (saw_tls_pressure && PostTlsHeapRecovered()) {
-            ESP_LOGI(TAG, "Post-TLS heap recovery detected; Classic BT takes table before audio");
-            LogHeap("post_tls_pre_audio_window");
-            return true;
+        if (saw_tls_pressure && DeepRecoveryObserved()) {
+            ++recovery_checks;
+            if (recovery_checks >= kRequiredRecoveryChecks) {
+                ESP_LOGI(TAG,
+                         "Deep post-TLS recovery stable (%d checks); BT may enter",
+                         kRequiredRecoveryChecks);
+                LogHeap("deep_recovery_open");
+                return true;
+            }
+        } else {
+            recovery_checks = 0;
         }
 
         vTaskDelay(kTlsPollDelay);
     }
 
-    ESP_LOGW(TAG, "V5 timed out waiting for TLS pressure/recovery cycle; BT skipped safely");
-    LogHeap("pre_audio_window_timeout");
+    ESP_LOGW(TAG, "V6 timed out waiting for safe deep recovery; BT skipped");
+    LogHeap("deep_recovery_timeout");
     return false;
 }
 
@@ -201,8 +224,27 @@ void GapCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* param) {
     }
 }
 
+void RollBackBtForHeadroom() {
+    ESP_LOGW(TAG, "BT headroom unsafe; rolling back controller to preserve MQTT");
+
+    if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED) {
+        esp_bluedroid_disable();
+    }
+    if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_INITIALIZED) {
+        esp_bluedroid_deinit();
+    }
+    if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        esp_bt_controller_disable();
+    }
+    if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED) {
+        esp_bt_controller_deinit();
+    }
+
+    LogHeap("after_bt_rollback");
+}
+
 void DiscoveryTask(void*) {
-    if (!WaitForPostTlsPreAudioWindow()) {
+    if (!WaitForDeepPostTlsRecovery()) {
         vTaskDelete(nullptr);
         return;
     }
@@ -217,7 +259,7 @@ void DiscoveryTask(void*) {
     }
     LogHeap("after_ble_release");
 
-    ESP_LOGI(TAG, "Initializing Classic Bluetooth Discovery V5 BEFORE audio task startup");
+    ESP_LOGI(TAG, "Initializing Classic Bluetooth Discovery V6");
     LogHeap("before_bt_controller_init");
 
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
@@ -234,6 +276,7 @@ void DiscoveryTask(void*) {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_bt_controller_enable failed: %s", esp_err_to_name(err));
         LogHeap("controller_enable_failed");
+        RollBackBtForHeadroom();
         vTaskDelete(nullptr);
         return;
     }
@@ -243,6 +286,7 @@ void DiscoveryTask(void*) {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_bluedroid_init failed: %s", esp_err_to_name(err));
         LogHeap("bluedroid_init_failed");
+        RollBackBtForHeadroom();
         vTaskDelete(nullptr);
         return;
     }
@@ -251,14 +295,24 @@ void DiscoveryTask(void*) {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_bluedroid_enable failed: %s", esp_err_to_name(err));
         LogHeap("bluedroid_enable_failed");
+        RollBackBtForHeadroom();
         vTaskDelete(nullptr);
         return;
     }
-    LogHeap("bluedroid_ready_pre_audio");
+    LogHeap("bluedroid_ready");
+
+    if (!InquiryHeadroomSafe()) {
+        ESP_LOGW(TAG,
+                 "Inquiry blocked: Bluedroid left insufficient MQTT-safe headroom");
+        RollBackBtForHeadroom();
+        vTaskDelete(nullptr);
+        return;
+    }
 
     err = esp_bt_gap_register_callback(GapCallback);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_bt_gap_register_callback failed: %s", esp_err_to_name(err));
+        RollBackBtForHeadroom();
         vTaskDelete(nullptr);
         return;
     }
@@ -269,7 +323,8 @@ void DiscoveryTask(void*) {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_bt_gap_start_discovery failed: %s", esp_err_to_name(err));
     } else {
-        ESP_LOGI(TAG, "Classic BT has the table; audio may start after activation resumes");
+        ESP_LOGI(TAG, "Classic BT inquiry started with MQTT-safe headroom gate passed");
+        LogHeap("inquiry_started");
     }
 
     vTaskDelete(nullptr);
