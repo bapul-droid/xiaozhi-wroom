@@ -14,16 +14,16 @@
 namespace {
 
 constexpr const char* TAG = "WROOM_BT";
-constexpr TickType_t kStatePollDelay = pdMS_TO_TICKS(1000);
-constexpr TickType_t kRetryDelay = pdMS_TO_TICKS(5000);
-constexpr int kRequiredStableReadyChecks = 8;
-constexpr int kMaxHeapChecks = 12;
-// Discovery V3: activation/protocol/TLS gets first claim on internal RAM.
-// Bluetooth discovery is allowed only after the application is idle AND the
-// protocol object exists for a continuous settling window, then it must still
-// pass the internal heap gate.
-constexpr size_t kMinFreeInternal = 90000;
-constexpr size_t kMinLargestInternal = 50000;
+constexpr TickType_t kProtocolPollDelay = pdMS_TO_TICKS(10);
+constexpr TickType_t kTlsDrainPollDelay = pdMS_TO_TICKS(1);
+constexpr int kRequiredTlsDrainStableChecks = 3;
+constexpr int kMaxTlsDrainChecks = 1500;  // ~1.5 s diagnostic window
+
+// V4 pre-audio diagnostic gate. While MQTT/TLS is active we previously saw
+// largest internal blocks around 21 KB. When TLS releases its transient buffers,
+// catch that short window before AudioService::Start() creates its task stacks.
+constexpr size_t kMinFreeInternalPreAudio = 40 * 1024;
+constexpr size_t kMinLargestInternalPreAudio = 24 * 1024;
 
 char* BdaToString(const esp_bd_addr_t bda, char* out, size_t size) {
     if (bda == nullptr || out == nullptr || size < 18) {
@@ -35,7 +35,8 @@ char* BdaToString(const esp_bd_addr_t bda, char* out, size_t size) {
 }
 
 void LogHeap(const char* phase) {
-    const size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t free_internal =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     const size_t largest_internal =
         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     const size_t min_internal =
@@ -43,7 +44,8 @@ void LogHeap(const char* phase) {
     const size_t free_dma = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     const size_t largest_dma =
         heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    const size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t free_spiram =
+        heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     const size_t largest_spiram =
         heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
@@ -59,61 +61,59 @@ void LogHeap(const char* phase) {
              static_cast<unsigned>(largest_spiram));
 }
 
-bool HeapReadyForBt() {
-    const size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+bool PreAudioHeapWindowOpen() {
+    const size_t free_internal =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     const size_t largest_internal =
         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    return free_internal >= kMinFreeInternal && largest_internal >= kMinLargestInternal;
+    return free_internal >= kMinFreeInternalPreAudio &&
+           largest_internal >= kMinLargestInternalPreAudio;
 }
 
-void WaitForStableReady() {
+bool WaitForPostTlsPreAudioWindow() {
     auto& app = Application::GetInstance();
-    int ready_checks = 0;
-    DeviceState last_state = app.GetDeviceState();
-    bool last_protocol_ready = app.IsProtocolReady();
 
-    ESP_LOGI(TAG, "Bluetooth Discovery V3 waiting for idle + protocol ready");
-    LogHeap("gate_start");
+    ESP_LOGI(TAG, "Bluetooth Discovery V4 waiting for protocol creation/TLS phase");
+    LogHeap("v4_start");
 
-    while (ready_checks < kRequiredStableReadyChecks) {
-        const DeviceState state = app.GetDeviceState();
-        const bool protocol_ready = app.IsProtocolReady();
-        const bool ready = state == kDeviceStateIdle && protocol_ready;
-
-        if (state != last_state || protocol_ready != last_protocol_ready) {
-            ESP_LOGI(TAG, "BT gate state=%d protocol=%s",
-                     static_cast<int>(state), protocol_ready ? "ready" : "not_ready");
-            LogHeap("gate_transition");
+    while (!app.IsProtocolReady()) {
+        if (app.GetDeviceState() == kDeviceStateIdle) {
+            ESP_LOGW(TAG, "V4 pre-audio window missed: application already idle");
+            return false;
         }
-
-        if (ready) {
-            ++ready_checks;
-            if (ready_checks == 1) {
-                ESP_LOGI(TAG, "Idle + protocol ready; starting %ds settle window",
-                         kRequiredStableReadyChecks);
-            }
-        } else {
-            if (ready_checks > 0) {
-                ESP_LOGW(TAG,
-                         "Ready settle interrupted: state=%d protocol=%s; restarting window",
-                         static_cast<int>(state), protocol_ready ? "ready" : "not_ready");
-            } else if (state != last_state || protocol_ready != last_protocol_ready) {
-                ESP_LOGI(TAG, "BT discovery deferred: state=%d protocol=%s",
-                         static_cast<int>(state), protocol_ready ? "ready" : "not_ready");
-            }
-            ready_checks = 0;
-        }
-
-        last_state = state;
-        last_protocol_ready = protocol_ready;
-        if (ready_checks < kRequiredStableReadyChecks) {
-            vTaskDelay(kStatePollDelay);
-        }
+        vTaskDelay(kProtocolPollDelay);
     }
 
-    ESP_LOGI(TAG, "Idle + protocol ready stable for %ds; activation gate passed",
-             kRequiredStableReadyChecks);
-    LogHeap("gate_passed");
+    ESP_LOGI(TAG, "Protocol object ready; watching for TLS heap release before audio starts");
+    LogHeap("protocol_ready_tls_active");
+
+    int stable_checks = 0;
+    for (int i = 0; i < kMaxTlsDrainChecks; ++i) {
+        if (app.GetDeviceState() == kDeviceStateIdle) {
+            ESP_LOGW(TAG, "V4 pre-audio window missed: audio/activation already reached idle");
+            LogHeap("pre_audio_window_missed");
+            return false;
+        }
+
+        if (PreAudioHeapWindowOpen()) {
+            ++stable_checks;
+            if (stable_checks >= kRequiredTlsDrainStableChecks) {
+                ESP_LOGI(TAG,
+                         "TLS heap drain detected before audio (%d stable checks); BT gets table next",
+                         kRequiredTlsDrainStableChecks);
+                LogHeap("pre_audio_window_open");
+                return true;
+            }
+        } else {
+            stable_checks = 0;
+        }
+
+        vTaskDelay(kTlsDrainPollDelay);
+    }
+
+    ESP_LOGW(TAG, "V4 pre-audio heap window never opened; skipping BT rather than racing audio");
+    LogHeap("pre_audio_window_timeout");
+    return false;
 }
 
 void LogDiscoveryResult(esp_bt_gap_cb_param_t* param) {
@@ -190,11 +190,13 @@ void GapCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* param) {
 }
 
 void DiscoveryTask(void*) {
-    WaitForStableReady();
+    if (!WaitForPostTlsPreAudioWindow()) {
+        vTaskDelete(nullptr);
+        return;
+    }
 
-    // This companion only uses Classic Bluetooth. Release the controller memory
-    // reserved for BLE before evaluating the Classic-BT heap gate. This operation
-    // is one-way until reboot, which is fine because BLE is intentionally unused.
+    // This companion only uses Classic Bluetooth. Release the BLE controller
+    // reservation immediately before Classic BT initialization.
     LogHeap("before_ble_release");
     esp_err_t ble_release_err = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
     if (ble_release_err == ESP_OK) {
@@ -205,22 +207,9 @@ void DiscoveryTask(void*) {
     }
     LogHeap("after_ble_release");
 
-    for (int attempt = 1; attempt <= kMaxHeapChecks; ++attempt) {
-        LogHeap("before_bt");
-        if (HeapReadyForBt()) {
-            ESP_LOGI(TAG, "Heap gate passed on check %d/%d", attempt, kMaxHeapChecks);
-            break;
-        }
-        if (attempt == kMaxHeapChecks) {
-            ESP_LOGW(TAG, "BT discovery skipped: internal heap never reached safe diagnostic gate");
-            vTaskDelete(nullptr);
-            return;
-        }
-        ESP_LOGW(TAG, "Heap gate not ready (%d/%d); retry in 5s", attempt, kMaxHeapChecks);
-        vTaskDelay(kRetryDelay);
-    }
+    ESP_LOGI(TAG, "Initializing Classic Bluetooth Discovery V4 BEFORE audio task startup");
+    LogHeap("before_bt_controller_init");
 
-    ESP_LOGI(TAG, "Initializing Classic Bluetooth Discovery V3");
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     esp_err_t err = esp_bt_controller_init(&bt_cfg);
     if (err != ESP_OK) {
@@ -234,13 +223,16 @@ void DiscoveryTask(void*) {
     err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_bt_controller_enable failed: %s", esp_err_to_name(err));
+        LogHeap("controller_enable_failed");
         vTaskDelete(nullptr);
         return;
     }
+    LogHeap("controller_enabled");
 
     err = esp_bluedroid_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_bluedroid_init failed: %s", esp_err_to_name(err));
+        LogHeap("bluedroid_init_failed");
         vTaskDelete(nullptr);
         return;
     }
@@ -248,10 +240,11 @@ void DiscoveryTask(void*) {
     err = esp_bluedroid_enable();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_bluedroid_enable failed: %s", esp_err_to_name(err));
+        LogHeap("bluedroid_enable_failed");
         vTaskDelete(nullptr);
         return;
     }
-    LogHeap("bluedroid_ready");
+    LogHeap("bluedroid_ready_pre_audio");
 
     err = esp_bt_gap_register_callback(GapCallback);
     if (err != ESP_OK) {
@@ -265,6 +258,8 @@ void DiscoveryTask(void*) {
     err = esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_bt_gap_start_discovery failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Classic BT has the table; audio may start after activation resumes");
     }
 
     vTaskDelete(nullptr);
