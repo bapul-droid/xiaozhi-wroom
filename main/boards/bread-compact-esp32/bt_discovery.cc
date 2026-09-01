@@ -7,12 +7,19 @@
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "esp_gap_bt_api.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 
 namespace {
 
 constexpr const char* TAG = "WROOM_BT";
-constexpr TickType_t kStartupDelay = pdMS_TO_TICKS(8000);
+constexpr TickType_t kInitialDelay = pdMS_TO_TICKS(15000);
+constexpr TickType_t kRetryDelay = pdMS_TO_TICKS(5000);
+constexpr int kMaxHeapChecks = 12;
+// Diagnostic gate only: don't attempt the relatively expensive BT controller
+// allocation while XiaoZhi/TLS is still consuming most internal RAM.
+constexpr size_t kMinFreeInternal = 90000;
+constexpr size_t kMinLargestInternal = 50000;
 
 char* BdaToString(const esp_bd_addr_t bda, char* out, size_t size) {
     if (bda == nullptr || out == nullptr || size < 18) {
@@ -21,6 +28,23 @@ char* BdaToString(const esp_bd_addr_t bda, char* out, size_t size) {
     snprintf(out, size, "%02x:%02x:%02x:%02x:%02x:%02x",
              bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
     return out;
+}
+
+void LogHeap(const char* phase) {
+    const size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t min_internal = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    ESP_LOGW(TAG, "HEAP %s: free_internal=%u largest_internal=%u min_internal=%u",
+             phase,
+             static_cast<unsigned>(free_internal),
+             static_cast<unsigned>(largest_internal),
+             static_cast<unsigned>(min_internal));
+}
+
+bool HeapReadyForBt() {
+    const size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    return free_internal >= kMinFreeInternal && largest_internal >= kMinLargestInternal;
 }
 
 void LogDiscoveryResult(esp_bt_gap_cb_param_t* param) {
@@ -97,17 +121,34 @@ void GapCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* param) {
 }
 
 void DiscoveryTask(void*) {
-    vTaskDelay(kStartupDelay);
+    vTaskDelay(kInitialDelay);
+
+    ESP_LOGI(TAG, "Bluetooth Discovery V1 heap-gated start");
+    for (int attempt = 1; attempt <= kMaxHeapChecks; ++attempt) {
+        LogHeap("before_bt");
+        if (HeapReadyForBt()) {
+            ESP_LOGI(TAG, "Heap gate passed on check %d/%d", attempt, kMaxHeapChecks);
+            break;
+        }
+        if (attempt == kMaxHeapChecks) {
+            ESP_LOGW(TAG, "BT discovery skipped: internal heap never reached safe diagnostic gate");
+            vTaskDelete(nullptr);
+            return;
+        }
+        ESP_LOGW(TAG, "Heap gate not ready (%d/%d); retry in 5s", attempt, kMaxHeapChecks);
+        vTaskDelay(kRetryDelay);
+    }
 
     ESP_LOGI(TAG, "Initializing Classic Bluetooth Discovery V1");
-
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     esp_err_t err = esp_bt_controller_init(&bt_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_bt_controller_init failed: %s", esp_err_to_name(err));
+        LogHeap("controller_init_failed");
         vTaskDelete(nullptr);
         return;
     }
+    LogHeap("controller_init_ok");
 
     err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
     if (err != ESP_OK) {
@@ -129,6 +170,7 @@ void DiscoveryTask(void*) {
         vTaskDelete(nullptr);
         return;
     }
+    LogHeap("bluedroid_ready");
 
     err = esp_bt_gap_register_callback(GapCallback);
     if (err != ESP_OK) {
